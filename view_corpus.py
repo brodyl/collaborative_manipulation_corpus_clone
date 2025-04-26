@@ -24,7 +24,9 @@ from PIL import Image, ImageTk
 # ---------- CONFIG --------------------------------------------------- #
 ROOT        = Path(__file__).resolve().parent
 CORPUS_CSV  = ROOT / "data" / "NLICorpusData.csv"
-EVAL_CSV    = ROOT / "data" / "evaluationData.csv"
+# EVAL_CSV    = ROOT / "data" / "evaluationData.csv"
+#  use the averaged file that contains Ambiguity & Perspective
+EVAL_CSV    = ROOT / "data" / "evaluationDataAvg.csv"
 IMG_DIR     = ROOT / "study1_images_with_red_arrows"
 VALID_EXTS  = {".png", ".jpg", ".jpeg"}
 TITLE       = "Collaborative Manipulation Corpus Viewer"
@@ -37,6 +39,11 @@ IMG_FRACTION_H    = 0.95          # max % of window height   "
 REDRAW_DELAY_MS   = 120           # ← how long to “wait” after last drag
 LIST_FONT         = ("Consolas", 9)
 CTRL_FONT         = ("Helvetica", 9, "bold")
+HDR_ROW = (
+    f"{'n×':<3} "
+    f"[{'Acc%':>4} | A:{'Amb':^4} | P:{'Perspective':<10}]  "
+    "Instruction text"
+)
 
 # ---------- HELPERS -------------------------------------------------- #
 name_pat = re.compile(r"Configuration_0*(\d+)_v0*(\d+)", re.I)
@@ -84,15 +91,37 @@ with CORPUS_CSV.open(newline="", encoding="utf-8") as f:
         except Exception:
             pass
 
-# ---------- LOAD EVALUATIONS (Study-2) ------------------------------- #
-eval_stats = defaultdict(lambda: [0, 0])   # norm → [correct, wrong]
+# ---------- LOAD EVALUATIONS (Study-2 averages) ---------------------- #
+#
+# evaluationDataAvg.csv gives one row per instruction with:
+#   • AccuracyAvg  (0-1 float)
+#   • Ambiguity    (float, ≥1   — number of blocks that match)
+#   • Perspective  (categorical string)
+#
+acc_map   = {}          # norm-text → accuracy (0-1) or None
+amb_map   = {}          # norm-text → float or None
+persp_map = {}          # norm-text → str   or None
 
 with EVAL_CSV.open(newline="", encoding="utf-8") as f:
     for row in csv.DictReader(f):
         k = index_norm.get(row["Index"])
         if not k:
             continue
-        eval_stats[k][0 if bool_from(row["Correctness"]) else 1] += 1
+
+        # accuracy -----------------------------------------------------
+        try:
+            acc_map[k] = float(row["AccuracyAvg"])
+        except (ValueError, KeyError):
+            acc_map[k] = None
+
+        # ambiguity ----------------------------------------------------
+        try:
+            amb_map[k] = float(row["Ambiguity"])
+        except (ValueError, KeyError):
+            amb_map[k] = None
+
+        # perspective --------------------------------------------------
+        persp_map[k] = row.get("Perspective", "").strip() or None
 
 # ---------- MEAN DIFFICULTY PER SCENARIO ----------------------------- #
 avg_diff = {
@@ -117,16 +146,27 @@ if not images:
     sys.exit("No matching images found")
 
 # ---------- UNIQUE-INSTRUCTION UTILITIES ----------------------------- #
+from statistics import mean, mode
+
 def unique_rows(instrs):
-    counter = Counter(norm(t) for t in instrs)
-    disp_map = {norm(t): t.strip() for t in instrs[::-1]}  # last wins for display
+    """
+    Returns a list of dicts, one per *unique* instruction text in `instrs`,
+    carrying:
+        text, count, acc, amb, persp, length
+    """
+    counter   = Counter(norm(t) for t in instrs)
+    disp_map  = {norm(t): t.strip() for t in instrs[::-1]}   # last wins
 
     rows = []
     for k, count in counter.items():
-        correct, wrong = eval_stats[k]
-        acc = correct / (correct + wrong) if (correct + wrong) else None
-        rows.append(dict(text=disp_map[k], count=count,
-                         correct=correct, wrong=wrong, acc=acc))
+        rows.append({
+            "text":   disp_map[k],
+            "count":  count,
+            "acc":    acc_map.get(k),          # 0-1 or None
+            "amb":    amb_map.get(k),          # float or None
+            "persp":  persp_map.get(k),        # str   or None
+            "len":    len(disp_map[k]),
+        })
     return rows
 
 
@@ -134,13 +174,19 @@ def sort_rows(rows, mode):
     if mode == "Count":
         return sorted(rows, key=lambda r: (-r["count"], r["text"].lower()))
     if mode == "Accuracy":
-        return sorted(
-            rows,
-            key=lambda r: (-(r["acc"] if r["acc"] is not None else -1),
-                           -r["count"], r["text"].lower())
-        )
+        return sorted(rows,
+                      key=lambda r: (r["acc"] is None,    # put “—” at bottom
+                                     -(r["acc"] or 0),
+                                     -r["count"]))
     if mode == "Length":
-        return sorted(rows, key=lambda r: (len(r["text"]), r["text"].lower()))
+        return sorted(rows, key=lambda r: (r["len"], r["text"].lower()))
+    if mode == "Ambiguity":
+        return sorted(rows,
+                      key=lambda r: (r["amb"] is None,    # “—” at bottom
+                                     r["amb"] or 0,
+                                     r["text"].lower()))
+    if mode == "Perspective":
+        return sorted(rows, key=lambda r: (r["persp"] or "").lower())
 
 
 # ---------- GUI CLASS ------------------------------------------------ #
@@ -157,8 +203,8 @@ class Viewer(Tk):
         self.bind("<Right>", lambda *_: self.move(-1))
         self.bind("w", lambda e: self.listbox.yview_scroll(-1, "units"))
         self.bind("s", lambda e: self.listbox.yview_scroll( 1, "units"))
-        self.bind("a", lambda e: self.listbox.xview_scroll(-1, "units"))
-        self.bind("d", lambda e: self.listbox.xview_scroll( 1, "units"))
+        self.bind("a", lambda e: self.listbox.xview_scroll(-5, "units"))
+        self.bind("d", lambda e: self.listbox.xview_scroll( 5, "units"))
 
         # — top-level layout -------------------------------------------
         main = Frame(self)
@@ -172,12 +218,21 @@ class Viewer(Tk):
         right = Frame(main, padx=3)
         right.pack(side=LEFT, fill=BOTH, expand=YES)
 
-        Label(right, text="Order unique instructions by:",
-              font=CTRL_FONT).pack(anchor="w")
+        # -- frame to hold Label + OptionMenu horizontally ---------------------
+        order_fr = Frame(right)
+        order_fr.pack(anchor="w", pady=(0, 2))  # ← pack the frame
+
+        Label(order_fr, text="Order by:", font=CTRL_FONT).pack(side=LEFT)
+
         self.order_var = StringVar(value="Count")
-        OptionMenu(right, self.order_var, "Count", "Accuracy", "Length",
-                   command=lambda *_: self.refresh_list()).pack(anchor="w",
-                                                                pady=(0, 4))
+        OptionMenu(order_fr, self.order_var,
+                   "Count", "Accuracy", "Length", "Ambiguity", "Perspective",
+                   command=lambda *_: self.refresh_list()
+                   ).pack(side=LEFT, padx=(6, 0))
+        
+        # -- static column header -------------------------------------
+        Label(right, text=HDR_ROW, font=LIST_FONT,
+              anchor="w", fg="grey25").pack(anchor="w", pady=(0, 2))
 
         list_fr = Frame(right); list_fr.pack(fill=BOTH, expand=YES)
         self.listbox = Listbox(list_fr, font=LIST_FONT, selectmode=SINGLE,
@@ -267,12 +322,17 @@ class Viewer(Tk):
     def refresh_list(self):
         rows = sort_rows(self._cached_rows, self.order_var.get())
         self.listbox.delete(0, "end")
+
         for r in rows:
-            acc_txt = f"{int(r['acc']*100):>3}%" if r["acc"] is not None else "--"
+            acc_txt = f"{int(r['acc'] * 100):>3}%" if r["acc"] is not None else "--"
+            amb_txt = f"{r['amb']:.1f}" if r["amb"] is not None else "--"
+            persp_txt = r["persp"] or "--"
+
             self.listbox.insert(
                 "end",
-                f"{f'{r['count']}×':<3}  [✔ {r['correct']:<3} / ✖ {r['wrong']:<2} | "
-                    f"{acc_txt:>4}]  {r['text']}"
+                f"{f'{r['count']}×':<3} "
+                f"[{acc_txt:>4} | A:{amb_txt:^4} | P:{persp_txt:<10}]  "
+                f"{r['text']}"
             )
         self.listbox.yview_moveto(0)
 
@@ -306,7 +366,9 @@ class Viewer(Tk):
             "   Count   – most frequently written first (default)\n"
             "   Accuracy – highest % correct first (instructions never evaluated "
             "drop to the bottom).\n"
-            "   Length   – shortest instructions listed first\n\n"
+            "   Length   – shortest instructions listed first\n"
+            "   Ambiguity – lowest mean #possible target blocks first\n"
+            "   Perspective – alphabetical by perspective label\n\n"
             "➡️  Navigation\n"
             "• Arrow keys  ←  →    or the on-screen buttons.\n"
         )
